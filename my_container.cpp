@@ -13,137 +13,107 @@
 #include <vector>
 #include <unordered_map>
 #include <dirent.h>
-#define REMOVE_CONTAINER_FOLDER_AFTER_DEATH 0
-#define MAX_CHILDREN 1024
-#define IPC 0
-
 
 typedef struct {
-    pid_t running[MAX_CHILDREN];
+    time_t container_id = 0;
+    char *container_folder = nullptr;
+    char *executable = nullptr;
+    char *hostname = nullptr;
+    long memory_limit = 67108864;  // 64 MB
+    long cpu_limit = 50000;        // 50%
+    int core_number = 0;
+    int read_iops = 100;
+    int write_iops = 50;
+} ContainerConfig;
+
+typedef struct {
+    pid_t running[512];
     int running_count;
-    pid_t zombie[MAX_CHILDREN];
+    pid_t zombie[512];
     int zombie_count;
-} ProcessesStatus;
+} ContainerProcessList;
 
-typedef struct {
-    time_t container_id;
-    char *container_folder;
-    char *executable;
-    char *hostname;
-    long memory_limit;
-    long cpu_limit;
-    int core_number;
-    int read_iops;
-    int write_iops;
-} ContinerDetail;
 
-void parse_arguments(int argc, char *argv[], ContinerDetail *containers, int *num_containers) {
-    int option;
-    int container_index = -1;
+void analyze_process_status(pid_t parent_pid, pid_t pid, ContainerProcessList *plist) {
+    char path[64], buffer[512];
+    FILE *file;
+    pid_t ppid = -1;
+    char state[16] = "Unknown";
 
-    // Parse command line arguments
-    while ((option = getopt(argc, argv, "e:h:m:c:r:w:")) != -1) {
-        switch (option) {
-            case 'e': {  // Executable file 
-                container_index++;
-                containers[container_index].container_id = time(NULL);
-                char *container_folder = (char *)malloc(200 * sizeof(char));
-                snprintf(container_folder, 200, "folder_%ld", (long)containers[container_index].container_id);
-                containers[container_index].container_folder = container_folder;
-                containers[container_index].executable = optarg;
-                containers[container_index].hostname = NULL;  // Initialize hostname to NULL
-                sleep(2);
-                break;
-            }
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    file = fopen(path, "r");
+    if (!file) return;
 
-            case 'h': {  // Hostname for the container
-                if (container_index >= 0) {
-                    containers[container_index].hostname = optarg;
-                } else {
-                    fprintf(stderr, "Error: Hostname specified without executable.\n");
-                    exit(1);
-                }
-                break;
-            }
+    while (fgets(buffer, sizeof(buffer), file)) {
+        if (strncmp(buffer, "PPid:", 5) == 0)
+            sscanf(buffer, "PPid:\t%d", &ppid);
+        else if (strncmp(buffer, "State:", 6) == 0)
+            sscanf(buffer, "State:\t%s", state);
+    }
+    fclose(file);
 
-            case 'm': { // memory limit
-                if (container_index >= 0) {
-                    containers[container_index].memory_limit = strtol(optarg, nullptr, 10);
-                } else {
-                    fprintf(stderr, "Error: memory limit specified without executable.\n");
-                    exit(1);
-                }
-                break;
-            }
-
-            case 'c': { // cpu limit
-                if (container_index >= 0) {
-                    containers[container_index].cpu_limit = strtol(optarg, nullptr, 10);
-                } else {
-                    fprintf(stderr, "Error: cpu limit specified without executable.\n");
-                    exit(1);
-                }
-                break;
-            }
-            
-            case 'r': {
-                if (container_index >= 0) {
-                    containers[container_index].read_iops = atoi(optarg);
-                } else {
-                    fprintf(stderr, "Error: read_iops limit specified without executable.\n");
-                    exit(1);
-                }
-                break;
-            }
-
-            case 'w': {
-                if (container_index >= 0) {
-                    containers[container_index].write_iops = atoi(optarg);
-                } else {
-                    fprintf(stderr, "Error: write_iops limit specified without executable.\n");
-                    exit(1);
-                }
-                break;
-            }
-
-            default: {
-                fprintf(stderr, "Usage: %s [-e executable] [-h hostname] [-m memory limit] [-c cpu limit]\n", argv[0]);
-                exit(1);
-            }
+    if (ppid == parent_pid) {
+        if (state[0] == 'Z') {
+            plist->zombie[plist->zombie_count++] = pid;
+        } else {
+            plist->running[plist->running_count++] = pid;
         }
     }
-
-    *num_containers = container_index + 1;
 }
 
-char* stack_memory() {
-    const int stackSize = 65536;
-    auto *stack = new (std::nothrow) char[stackSize];
 
-    if (stack == nullptr) { 
-        printf("Cannot allocate memory \n");
-        exit(EXIT_FAILURE);
-    }  
+void gather_container_processes(pid_t manager_pid, ContainerProcessList *plist) {
+    DIR *proc = opendir("/proc");
+    if (!proc) {
+        perror("[Error] Failed to open /proc");
+        return;
+    }
 
-    return stack+stackSize;
+    struct dirent *entry;
+    plist->running_count = 0;
+    plist->zombie_count = 0;
+
+    while ((entry = readdir(proc))) {
+        if (!isdigit(entry->d_name[0])) continue;
+
+        pid_t pid = atoi(entry->d_name);
+        analyze_process_status(manager_pid, pid, plist);
+    }
+    closedir(proc);
 }
 
-void setup_variables() {
+
+char* allocate_stack_memory() {
+    constexpr int kStackSize = 64 * 1024;  // 64KB stack
+    char* stack = new (std::nothrow) char[kStackSize];
+
+    if (!stack) {
+        std::fprintf(stderr, "[Fatal] Failed to allocate stack memory.\n");
+        std::exit(EXIT_FAILURE);
+    }
+
+    // Return pointer to the top of the stack (stack grows downward)
+    return stack + kStackSize;
+}
+
+void initialize_environment_variables() {
     clearenv();
-    setenv("TERM", "xterm-256color", 0);
-    setenv("PATH", "/:/bin/:/sbin/:usr/bin:/usr/sbin", 0);
+    // Set TERM variable
+    if (setenv("TERM", "xterm-256color", 1) != 0) {
+        perror("Failed to set TERM environment variable");
+        exit(EXIT_FAILURE);
+    }
+    // Set PATH variable
+    if (setenv("PATH", "/:/bin/:/sbin/:/usr/bin:/usr/sbin", 1) != 0) {
+        perror("Failed to set PATH environment variable");
+        exit(EXIT_FAILURE);
+    }
 }
 
-void setup_root(const char* folder){
-    chroot(folder);
-    chdir("/");
-}
-
-void set_memory_cgroup(ContinerDetail *container_config)
+void set_memory_cgroup(ContainerConfig *container_config)
 {
     char command[512];
 
-    // Create cgroup v2 folder
     snprintf(command, sizeof(command), "mkdir -p /sys/fs/cgroup/%s", container_config->container_folder);
     if (system(command) == -1)
     {
@@ -151,10 +121,8 @@ void set_memory_cgroup(ContinerDetail *container_config)
         exit(EXIT_FAILURE);
     }
 
-    // Enable memory controller in parent if not already done
-    // system("echo +memory > /sys/fs/cgroup/cgroup.subtree_control");
+    system("echo +memory > /sys/fs/cgroup/cgroup.subtree_control");
 
-    // Set memory limit using cgroup v2's memory.max
     snprintf(command, sizeof(command),
              "echo %ld > /sys/fs/cgroup/%s/memory.max",
              container_config->memory_limit, container_config->container_folder);
@@ -164,7 +132,6 @@ void set_memory_cgroup(ContinerDetail *container_config)
         exit(EXIT_FAILURE);
     }
 
-    // Assign current process to the cgroup
     snprintf(command, sizeof(command),
              "echo %d > /sys/fs/cgroup/%s/cgroup.procs",
              getpid(), container_config->container_folder);
@@ -175,25 +142,21 @@ void set_memory_cgroup(ContinerDetail *container_config)
     }
 }
 
-void set_cpu_cgroup(ContinerDetail *container_config)
+void set_cpu_cgroup(ContainerConfig *container_config)
 {
     char command[512];
 
-    Create CPU cgroup directory
+    // Create CPU cgroup directory
     snprintf(command, sizeof(command), "mkdir -p /sys/fs/cgroup/%s", container_config->container_folder);
     if (system(command) == -1)
     {
         perror("mkdir failed");
         exit(EXIT_FAILURE);
     }
+
     // Enable CPU controller in parent
-    int r = system("echo +cpu > tee /sys/fs/cgroup/cgroup.subtree_control > /dev/null");
-    if (r!=0){
-    printf("$$$");
-    fflush(stdout);
-    }
-    printf("%d",r);
-    fflush(stdout);
+    system("echo +cpu > /sys/fs/cgroup/cgroup.subtree_control");
+
     // Set CPU limit: quota period format (50% = 50000 / 100000)
     snprintf(command, sizeof(command),
              "echo \"%ld 100000\" > /sys/fs/cgroup/%s/cpu.max",
@@ -201,51 +164,6 @@ void set_cpu_cgroup(ContinerDetail *container_config)
     if (system(command) == -1)
     {
         perror("cpu.max write failed");
-        exit(EXIT_FAILURE);
-    }
-    snprintf(command, sizeof(command),
-             "echo %d > /sys/fs/cgroup/%s/cgroup.procs",
-             getpid(), container_config->container_folder);
-    if (system(command) == -1)
-    {
-        perror("cgroup.procs write failed");
-        exit(EXIT_FAILURE);
-    }
-}
-
-void set_IO_cgroup(ContinerDetail *container_config)
-{
-    char command[512];
-    const char *device = "8:0"; // Update if using another device
-
-    // Create IO cgroup directory
-    snprintf(command, sizeof(command), "mkdir -p /sys/fs/cgroup/%s", container_config->container_folder);
-    if (system(command) == -1)
-    {
-        perror("mkdir failed");
-        exit(EXIT_FAILURE);
-    }
-
-    // Enable IO controller in parent
-    system("echo +io > /sys/fs/cgroup/cgroup.subtree_control");
-
-    // Set read IOPS limit
-    snprintf(command, sizeof(command),
-             "echo '%s rbps=max riops=%d wbps=max wiops=max' > /sys/fs/cgroup/%s/io.max",
-             device, container_config->read_iops, container_config->container_folder);
-    if (system(command) == -1)
-    {
-        perror("io.max (read) write failed");
-        exit(EXIT_FAILURE);
-    }
-
-    // Set write IOPS limit
-    snprintf(command, sizeof(command),
-             "echo '%s rbps=max riops=max wbps=max wiops=%d' > /sys/fs/cgroup/%s/io.max",
-             device, container_config->write_iops, container_config->container_folder);
-    if (system(command) == -1)
-    {
-        perror("io.max (write) write failed");
         exit(EXIT_FAILURE);
     }
 
@@ -260,11 +178,53 @@ void set_IO_cgroup(ContinerDetail *container_config)
     }
 }
 
-void init_container(ContinerDetail *container_config)
+void set_IO_cgroup(ContainerConfig *container_config)
 {
+    char command[512];
+    const char *device = "8:0";
+
+    // Create IO cgroup directory
+    snprintf(command, sizeof(command), "mkdir -p /sys/fs/cgroup/%s", container_config->container_folder);
+    if (system(command) == -1)
+    {
+        perror("mkdir failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Enable IO controller in parent
+    system("echo +io > /sys/fs/cgroup/cgroup.subtree_control");
+
+    // Set read & IOPS limit
+    snprintf(command, sizeof(command),
+            "echo '%s rbps=max riops=%d wbps=max wiops=%d' > /sys/fs/cgroup/%s/io.max",
+            device,
+            container_config->read_iops,
+            container_config->write_iops,
+            container_config->container_folder);
+    if (system(command) == -1) {
+        perror("Failed to write combined IOPS to io.max");
+        exit(EXIT_FAILURE);
+
+        // Add current process to cgroup
+        snprintf(command, sizeof(command),
+                "echo %d > /sys/fs/cgroup/%s/cgroup.procs",
+                getpid(), container_config->container_folder);
+        if (system(command) == -1)
+        {
+            perror("cgroup.procs write failed");
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
+void init_container(ContainerConfig *container_config)
+{
+    // set cgroup limits
+    set_memory_cgroup(container_config);
     set_cpu_cgroup(container_config);
     set_IO_cgroup(container_config);
-    set_memory_cgroup(container_config);
+
+    // Set CPU affinity
     int core = container_config->core_number;
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
@@ -274,64 +234,62 @@ void init_container(ContinerDetail *container_config)
         perror("sched_setaffinity");
         exit(EXIT_FAILURE);
     }
-    printf("aaaaaa");
-    fflush(stdout);
 }
 
-void setup_root_directory(ContinerDetail *jailArgs)
+void setup_root_directory(ContainerConfig *containerConfig)
 {
     char command[300];
-    snprintf(command, sizeof(command), "mkdir ./containers/%s > /dev/null", jailArgs->container_folder);
+    snprintf(command, sizeof(command), "mkdir ./containers/%s > /dev/null", containerConfig->container_folder);
     if (system(command) == -1){
         perror("system failed");
         exit(EXIT_FAILURE);
     }
-    snprintf(command, sizeof(command), "mkdir ./containers/%s/lib/x86_64-linux-gnu", jailArgs->container_folder);
-    system(command);
-    snprintf(command, sizeof(command), "mkdir ./containers/%s/lib64", jailArgs->container_folder);
-    system(command);
-    snprintf(command, sizeof(command), "sudo cp /lib/x86_64-linux-gnu/libc.so.6 ./containers/%s/lib/x86_64-linux-gnu", jailArgs->container_folder);
-    system(command);
-    snprintf(command, sizeof(command), "sudo cp /lib64/ld-linux-x86-64.so.2 ./containers/%s/lib64/", jailArgs->container_folder);
-    system(command);
-    snprintf(command, sizeof(command), "tar -xzf alpine-minirootfs-3.7.0-x86_64.tar.gz -C ./containers/%s", jailArgs->container_folder);
+    snprintf(command, sizeof(command), "tar -xzf alpine-minirootfs-3.7.0-x86_64.tar.gz -C ./containers/%s", containerConfig->container_folder);
     if (system(command) == -1){
         perror("system failed");
         exit(EXIT_FAILURE);
     }
-    snprintf(command, sizeof(command), "sudo cp %s ./containers/%s", jailArgs->executable, jailArgs->container_folder);
+    snprintf(command, sizeof(command), "sudo cp %s ./containers/%s", containerConfig->executable, containerConfig->container_folder);
     if (system(command) == -1){
         perror("system failed");
         exit(EXIT_FAILURE);
     }    
+    snprintf(command, sizeof(command), "mkdir ./containers/%s/lib/x86_64-linux-gnu", containerConfig->container_folder);
+    system(command);
+    snprintf(command, sizeof(command), "mkdir ./containers/%s/lib64", containerConfig->container_folder);
+    system(command);
+    snprintf(command, sizeof(command), "sudo cp /lib/x86_64-linux-gnu/libc.so.6 ./containers/%s/lib/x86_64-linux-gnu", containerConfig->container_folder);
+    system(command);
+    snprintf(command, sizeof(command), "sudo cp /lib64/ld-linux-x86-64.so.2 ./containers/%s/lib64/", containerConfig->container_folder);
+    system(command);
 }
 
-int Cont(void *args) {
-    ContinerDetail *jailArgs = (ContinerDetail *)args;
+int CreateContainer(void *args) {
+    ContainerConfig *containerConfig = (ContainerConfig *)args;
 
     printf("Initializing container...\n");
-    init_container(jailArgs);
+    init_container(containerConfig);
 
     printf("Setting up root directory...\n");
-    setup_root_directory(jailArgs);
+    setup_root_directory(containerConfig);
 
     char new_root_path[300];
-    snprintf(new_root_path, sizeof(new_root_path), "./containers/%s", jailArgs->container_folder);
+    snprintf(new_root_path, sizeof(new_root_path), "./containers/%s", containerConfig->container_folder);
 
     printf("Changing root to: %s\n", new_root_path);
-    setup_variables();
-    setup_root(new_root_path);
+    initialize_environment_variables();
+    chroot(new_root_path);
+    chdir("/");
 
     mkdir("/proc", 0555);
 
-    printf("Mounting /proc...\n");
     if (mount("proc", "/proc", "proc", 0, NULL) == -1) {
         perror("mount /proc failed");
         exit(EXIT_FAILURE);
     }
 
-    // Set hostname
-    if (sethostname(jailArgs->hostname, strlen(jailArgs->hostname)) == -1) {
+    // Set container hostname
+    if (sethostname(containerConfig->hostname, strlen(containerConfig->hostname)) == -1) {
         perror("error setting hostname");
         exit(EXIT_FAILURE);
     }
@@ -344,7 +302,7 @@ int Cont(void *args) {
 
     if (pid == 0) {
         // CHILD PROCESS
-        char *executable_name = basename(jailArgs->executable);
+        char *executable_name = basename(containerConfig->executable);
         printf("Attempting to run: /%s\n", executable_name);
         fflush(stdout);
 
@@ -355,146 +313,211 @@ int Cont(void *args) {
         perror("execl failed");
         exit(EXIT_FAILURE);
     } else {
-        // PARENT PROCESS
+        // PARENT
         int status;
-        wait(&status);
-
-        if (WIFEXITED(status)) {
-            printf("Child exited with code %d\n", WEXITSTATUS(status));
+        if (waitpid(pid, &status, 0) == -1) {
+            perror("[parent] waitpid failed");
+        } else if (WIFEXITED(status)) {
+            printf("\n [parent] Child exited with code %d\n", WEXITSTATUS(status));
         } else if (WIFSIGNALED(status)) {
-            printf("Child killed by signal %d\n", WTERMSIG(status));
+            printf("[parent] Child killed by signal %d (%s)\n", WTERMSIG(status), strsignal(WTERMSIG(status)));
         } else {
-            printf("Child exited abnormally\n");
+            printf("[parent] Child exited abnormally\n");
         }
     }
-
-    printf("Cleaning up...\n");
     umount("/proc");
 
     return EXIT_SUCCESS;
 }
 
-void FindStatus(pid_t parent_pid, pid_t pid, ProcessesStatus *child_list) {
-    char path[64], buffer[512];
-    FILE *file;
-    pid_t ppid = -1;
-    snprintf(path, sizeof(path), "/proc/%d/status", pid);
-    file = fopen(path, "r");
-    if (!file) return;
-    while (fgets(buffer, sizeof(buffer), file)) {
-        if (strncmp(buffer, "PPid:", 5) == 0)
-            sscanf(buffer, "PPid:\t%d", &ppid);
-        else if (strncmp(buffer, "State:", 6) == 0)
-            sscanf(buffer, "State:\t%s", state);
+void show_container_status(const std::unordered_map<int, pid_t>& pid_map, ContainerConfig configs[]) {
+    ContainerProcessList list;
+    gather_container_processes(getpid(), &list);
+    printf("[Status] Active Containers:\n");
+    for (int i = 0; i < list.running_count; ++i) {
+        int idx = pid_map.at(list.running[i]);
+        printf("PID: %d\tHostname: %s\n", list.running[i], configs[idx].hostname);
     }
-    fclose(file);
-    if (ppid == parent_pid) {
-        if (state[0] == 'Z') {
-            child_list->zombie[child_list->zombie_count++] = pid;
-        } else {
-            child_list->running[child_list->running_count++] = pid;
+    printf("\n");
+    printf("[Status] Zombie Containers:\n");
+    for (int i = 0; i < list.zombie_count; ++i) {
+        int idx = pid_map.at(list.zombie[i]);
+        printf("PID: %d\tHostname: %s\n", list.zombie[i], configs[idx].hostname);
+    }
+    printf("\n");
+}
+
+void terminate_container(pid_t pid) {
+    if (kill(pid, SIGKILL) == 0) {
+        printf("[Terminate] Process %d killed.\n", pid);
+    } else {
+        perror("[Terminate] Failed");
+    }
+}
+
+void restart_container(pid_t pid, ContainerConfig configs[], int &count, std::unordered_map<int, pid_t>& pid_map) {
+    int idx = pid_map[pid];
+    ContainerConfig old_cfg = configs[idx];
+
+    if (kill(pid, SIGKILL) != 0) {
+        perror("[Restart] Failed to kill");
+        return;
+    }
+
+    ++count;
+    time_t id = time(nullptr);
+    char *new_folder = (char*)malloc(256);
+    snprintf(new_folder, 255, "folder_%ld", id);
+
+    configs[count - 1] = {
+        old_cfg.container_id,
+        new_folder,
+        old_cfg.executable,
+        old_cfg.hostname,
+        old_cfg.memory_limit,
+        old_cfg.cpu_limit,
+        old_cfg.core_number,
+        old_cfg.read_iops,
+        old_cfg.write_iops
+    };
+
+    pid_t new_pid = clone(CreateContainer, allocate_stack_memory(), CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD, (void *)&configs[count - 1]);
+    printf("[Restart] Replaced PID %d with PID %d (Hostname: %s)\n", pid, new_pid, old_cfg.hostname);
+    pid_map[new_pid] = count - 1;
+}
+
+void wait_for_containers(int count) {
+    printf("[Wait] Waiting for containers to finish...\n");
+    for (int i = 0; i < count; ++i) {
+        wait(nullptr);
+    }
+}
+
+void parse_cli_args(int argc, char *argv[], ContainerConfig *configs) {
+    int opt;
+    int current = -1;
+
+    while ((opt = getopt(argc, argv, "x:n:m:u:i:o:")) != -1) {
+        switch (opt) {
+            case 'x': {  // Executable
+                current++;
+                configs[current].container_id = time(NULL);
+
+                char *folder = (char *)malloc(200);
+                snprintf(folder, 200, "folder_%ld", (long)configs[current].container_id);
+                configs[current].container_folder = folder;
+
+                configs[current].executable = optarg;
+                configs[current].hostname = NULL;  // Initialize to NULL
+                break;
+            }
+
+            case 'n': {  // Hostname
+                if (current >= 0) {
+                    configs[current].hostname = optarg;
+                } else {
+                    fprintf(stderr, "[Error] --hostname (-n) must follow an executable (-x)\n");
+                    exit(EXIT_FAILURE);
+                }
+                break;
+            }
+
+            case 'm': {  // Memory limit
+                if (current >= 0) {
+                    configs[current].memory_limit = strtol(optarg, nullptr, 10);
+                } else {
+                    fprintf(stderr, "[Error] --memory (-m) must follow an executable (-x)\n");
+                    exit(EXIT_FAILURE);
+                }
+                break;
+            }
+
+            case 'u': {  // CPU quota
+                if (current >= 0) {
+                    configs[current].cpu_limit = strtol(optarg, nullptr, 10);
+                } else {
+                    fprintf(stderr, "[Error] --cpu (-u) must follow an executable (-x)\n");
+                    exit(EXIT_FAILURE);
+                }
+                break;
+            }
+
+            case 'i': {  // Read IOPS
+                if (current >= 0) {
+                    configs[current].read_iops = atoi(optarg);
+                } else {
+                    fprintf(stderr, "[Error] --read-iops (-i) must follow an executable (-x)\n");
+                    exit(EXIT_FAILURE);
+                }
+                break;
+            }
+
+            case 'o': {  // Write IOPS
+                if (current >= 0) {
+                    configs[current].write_iops = atoi(optarg);
+                } else {
+                    fprintf(stderr, "[Error] --write-iops (-o) must follow an executable (-x)\n");
+                    exit(EXIT_FAILURE);
+                }
+                break;
+            }
+
+            default: {
+                fprintf(stderr, "Usage:\n");
+                fprintf(stderr, "  %s -x <executable> [-n <hostname>] [-m <mem>] [-u <cpu>] [-i <read-iops>] [-o <write-iops>] ...\n", argv[0]);
+                exit(EXIT_FAILURE);
+            }
         }
     }
 }
 
-void ReadChild(pid_t parent_pid, ProcessesStatus *child_list) {
-    DIR *dir = opendir("/proc");
-    if (!dir) {
-        perror("opendir");
-        return;
-    }
-
-    struct dirent *entry;
-    child_list->running_count = 0;
-    child_list->zombie_count = 0;
-
-    while ((entry = readdir(dir))) {
-        if (!isdigit(entry->d_name[0])) continue;
-
-        pid_t pid = atoi(entry->d_name);
-        FindStatus(parent_pid, pid, child_list);
-    }
-    closedir(dir);
-}
-
 int main(int argc, char *argv[]) {
-    long num_cores = sysconf(_SC_NPROCESSORS_ONLN);
-    if (num_cores == -1) {
+    printf("[Manager] PID %d started.\n", getpid());
+
+    long core_count = sysconf(_SC_NPROCESSORS_ONLN);
+    if (core_count == -1) {
         perror("sysconf");
         exit(EXIT_FAILURE);
     }
 
-    std::vector<char*> container_folders;
+    std::vector<char*> container_dirs;
+    ContainerConfig configs[20];
+    int container_count = 0;
+    std::unordered_map<int, pid_t> pid_to_index;
 
-    ContinerDetail cont_configs[20];
-    int num_containers = 0;
-    std::unordered_map<int, pid_t> idx_pid_containers;
-    parse_arguments(argc, argv, cont_configs, &num_containers);
-    for (size_t i = 0; i < num_containers; i++)
-    {
-        cont_configs[i].core_number = (i % num_cores);
-        int flags = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD;
-        if (IPC)
-            flags |= CLONE_NEWIPC;
-        pid_t child_pid = clone(Cont, stack_memory(), flags, (void *)&cont_configs[i]);
-        printf("child process %d with hostname %s created.\n", child_pid, cont_configs[i].hostname);
-        idx_pid_containers[child_pid] = i;
+    parse_cli_args(argc, argv, configs);
+
+    int flags = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD;
+    pid_t pid = clone(CreateContainer, allocate_stack_memory(), flags, (void *)&configs[0]);
+    printf("[Manager] Container started (PID: %d, Hostname: %s)\n", pid, configs[0].hostname);
+    pid_to_index[pid] = 0;
+
+
+    char input[256];
+    while (1) {
+        printf("[Command] Enter [status, terminate <PID>, restart <PID>, exit]: ");
+        if (!fgets(input, sizeof(input), stdin)) break;
+        input[strcspn(input, "\n")] = 0;
+
+        if (strcmp(input, "status") == 0) {
+            show_container_status(pid_to_index, configs);
+        } else if (strncmp(input, "terminate", 9) == 0) {
+            pid_t pid = atoi(input + 10);
+            terminate_container(pid);
+        } else if (strncmp(input, "restart", 7) == 0) {
+            pid_t pid = atoi(input + 8);
+            restart_container(pid, configs, container_count, pid_to_index);
+        } else if (strcmp(input, "exit") == 0) {
+            break;
+        } else {
+            printf("[Error] Unknown command.\n");
+        }
     }
 
-    char command[256];
-    while (1)
-    {
-        printf("commands: [list, restart {PID}, exit] :");
-        if (fgets(command, sizeof(command), stdin) == NULL) {
-            break;
-        }
-        
-        if (strcmp(command, "list") == 0)
-        {
-            pid_t pid = getpid();
-            ProcessesStatus child_list;
-            ReadChild(pid, &child_list);
-            
-            printf("RUNNING containers:\n");
-            for (size_t i = 0; i < child_list.running_count; i++)
-            {
-                int idx = idx_pid_containers[child_list.running[i]];
-                printf("pid: %d\t\thostname: %s\n", child_list.running[i], cont_configs[idx].hostname);
-            }
-            printf("\nZOMBIE containers:\n");
-            for (size_t i = 0; i < child_list.zombie_count; i++)
-            {
-                int idx = idx_pid_containers[child_list.zombie[i]];
-                printf("pid: %d\t\thostname: %s\n", child_list.zombie[i], cont_configs[idx].hostname);
-            }
-            printf("\n");
-        }
-        else if((strcmp(command, "exit") == 0))
-        {
-            break;
-        }
-        else if (strncmp(command, "restart", 7) == 0)
-        {
-            pid_t pid = atoi(command + 8);
-            ContinerDetail old_args = cont_configs[idx_pid_containers[pid]];
-            printf("pid: %d\n", pid);
-            if (kill(pid, SIGKILL) == 0)
-            { }
-            else {
-                perror("unable to restart process");
-            }
-            num_containers++;
-            cont_configs[num_containers - 1].container_id = time(nullptr);
-            char *folder_name = (char*)malloc(256 * sizeof(char));
-            snprintf(folder_name, 255, "folder_%ld", cont_configs[num_containers - 1].container_id);
-            cont_configs[num_containers - 1].container_folder = folder_name;
-            cont_configs[num_containers - 1].hostname = old_args.hostname;
-            cont_configs[num_containers - 1].executable = old_args.executable;
-            pid_t child_pid = clone(Cont, stack_memory(), CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD, (void *)&cont_configs[num_containers - 1]);
-            printf("child process %d with hostname %s created (replaced %d).\n", child_pid, cont_configs[num_containers - 1].hostname, pid);
-            idx_pid_containers[child_pid] = num_containers - 1;
-        }
-    }
-    for (size_t i = 0; i < num_containers; i++)
-        pid_t pid = wait(nullptr);
+    wait_for_containers(container_count);
+    printf("[Manager] Shutdown complete.\n");
+    return EXIT_SUCCESS;
 }
+
+
+// "I collaborated with my classmate Omid Heydari on this code."
