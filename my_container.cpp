@@ -482,15 +482,19 @@ int main(int argc, char *argv[]) {
 
     std::vector<char*> container_dirs;
     ContainerConfig configs[20];
-    int container_count = 0;
+    int container_count = 1;
     std::unordered_map<int, pid_t> pid_to_index;
 
     parse_cli_args(argc, argv, configs);
 
-    int flags = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD;
-    pid_t pid = clone(CreateContainer, allocate_stack_memory(), flags, (void *)&configs[0]);
-    printf("[Manager] Container started (PID: %d, Hostname: %s)\n", pid, configs[0].hostname);
-    pid_to_index[pid] = 0;
+    for (int i = 0; i < container_count; ++i) {
+        configs[i].core_number = (i % core_count);
+        int flags = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD;
+
+        pid_t pid = clone(CreateContainer, allocate_stack_memory(), flags, (void *)&configs[i]);
+        printf("[Manager] Container %d started (PID: %d, Hostname: %s)\n", i, pid, configs[i].hostname);
+        pid_to_index[pid] = i;
+    }
 
 
     char input[256];
